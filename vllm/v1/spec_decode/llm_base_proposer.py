@@ -606,6 +606,15 @@ class SpecDecodeBaseProposer:
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(True)
+            # Backport of upstream #47238: step 0 wrote topk indices for each
+            # query token in the multi-token batch, but steps 1+ run one token
+            # per request and read rows [0:num_reqs) of the shared buffer.
+            # Compact each request's last-token row to the front so the reused
+            # indices belong to the token being extended. Guarded so a model
+            # that implements set_skip_topk without the compaction hook keeps
+            # the previous (uncompacted) behavior instead of crashing.
+            if hasattr(self.model.model, "compact_topk_indices"):
+                self.model.model.compact_topk_indices(token_indices_to_sample)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 

@@ -447,6 +447,32 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                     if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
                         mla_attn.skip_topk = skip
 
+    def compact_topk_indices(self, slot_ids: torch.Tensor):
+        """Gather the top-k index rows at ``slot_ids`` to the front of the buffer.
+
+        Backport of upstream #47238: step 0 of index_share_for_mtp_iteration
+        writes top-k indices for EVERY query token of the multi-token batch,
+        but steps 1+ run with one token per request and read rows
+        [0:num_reqs) of the shared buffer. Compacting each request's
+        last-token row to the front aligns the reused indices with the token
+        that actually continues drafting (MTP acceptance 57.7% -> 61.5%
+        upstream). Only the indices buffer needs moving: the DCP
+        topk_scores_buffer is an indexer-internal intermediate and the
+        indexer is skipped entirely on steps 1+ (skip_topk=True).
+        """
+        num_slots = slot_ids.numel()
+        for layer in self.layers.values():
+            mtp_block = getattr(layer, "mtp_block", None)
+            if mtp_block is not None:
+                self_attn = getattr(mtp_block, "self_attn", None)
+                if self_attn is not None:
+                    mla_attn = getattr(self_attn, "mla_attn", None)
+                    if mla_attn is not None and hasattr(
+                        mla_attn, "topk_indices_buffer"
+                    ):
+                        topk_indices_buffer = mla_attn.topk_indices_buffer
+                        topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
