@@ -50,7 +50,31 @@ def set_dspark_aux_hidden_state_layers(
     DeepSeek's reference DSpark code concatenates mean(HC-stream) hidden states
     after the configured target layers. This is not EAGLE3's pre-layer residual
     capture, so keep it as a separate mode.
+
+    dspark3 note: the standalone speculators-format DSpark draft (arch
+    ``Qwen3DSparkModel``, #47093) is a DFlash-style dense Qwen3 draft. It
+    consumes EAGLE3/DFlash auxiliary hidden states
+    (``eagle_aux_hidden_state_layer_ids``, set by ``update_dspark`` exactly like
+    ``update_dflash``), NOT the DeepSeek-V4 integrated mean-pooled HC-stream
+    capture below (which needs ``dspark_target_layer_ids`` on the config and a
+    ``set_dspark_aux_hidden_state_layers`` method on the target -- neither of
+    which the GLM target/checkpoint has). ``model_runner.load_model`` dispatches
+    here purely on ``method=="dspark"``, so intercept the standalone arch here
+    and delegate to the exact same target-aux hook ``method:dflash`` uses. The
+    DeepSeek-V4 path below is left byte-for-byte unchanged. See RECONCILE.md.
     """
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    draft_architectures = (
+        getattr(draft_model_config, "architectures", None) or []
+    )
+    if "Qwen3DSparkModel" in draft_architectures:
+        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+            set_eagle3_aux_hidden_state_layers,
+        )
+
+        set_eagle3_aux_hidden_state_layers(model, spec_config)
+        return
+
     layer_ids = _get_target_layer_ids(spec_config)
     parent_ref = (
         model.get_language_model() if hasattr(model, "get_language_model") else model

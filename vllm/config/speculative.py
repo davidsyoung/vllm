@@ -950,7 +950,15 @@ class SpeculativeConfig:
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
-                elif "dspark" in self.draft_model_config.model.lower():
+                # deepseek-ai/dspark_qwen3_8b_block7 (path marker), or the
+                # standalone speculators-format DSpark checkpoint whose
+                # `update_dspark` algo sets architectures=["Qwen3DSparkModel"]
+                # (#47093). The arch check makes detection robust when the
+                # draft path does not literally contain "dspark".
+                elif (
+                    "dspark" in self.draft_model_config.model.lower()
+                    or "Qwen3DSparkModel" in self.draft_model_config.architectures
+                ):
                     self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"

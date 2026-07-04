@@ -35,6 +35,24 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             backend=speculative_config.attention_backend,
         ),
     )
+    # Honor the speculative-config draft KV cache dtype (mirrors
+    # eagle/utils.py::_create_draft_vllm_config, which the V2 DFlash/DSpark load
+    # path otherwise skipped). Critical when the TARGET uses an MLA/DSA fp8 KV
+    # format (e.g. GlmMoeDsa's fp8_ds_mla): the DENSE DFlash/DSpark draft
+    # otherwise inherits the engine-wide MLA cache_dtype via
+    # current_vllm_config.cache_config, and a dense backend like TRITON_ATTN
+    # rejects it ("kv_cache_dtype not supported"). Setting
+    # draft_kv_cache_dtype:"auto" (or "bfloat16") gives the dense draft a
+    # TRITON-compatible KV dtype independent of the target's MLA fp8. Guarded on
+    # `is not None`, so default behavior (draft inherits target) is unchanged.
+    if speculative_config.draft_kv_cache_dtype is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            cache_config=replace(
+                draft_vllm_config.cache_config,
+                cache_dtype=speculative_config.draft_kv_cache_dtype,
+            ),
+        )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(
             vllm_config=draft_vllm_config, model_config=draft_model_config
