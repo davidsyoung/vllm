@@ -199,30 +199,71 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
         )
 
-        ret = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
-            query=q.unsqueeze(1),
-            kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
-            workspace_buffer=self._workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=topk_indices_physical.unsqueeze(1),
-            seq_lens=seq_lens,
-            max_seq_len=attn_metadata.topk_tokens,
-            out=output.unsqueeze(1),
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            sparse_mla_top_k=attn_metadata.topk_tokens,
-            kv_scale_format=self.kv_scale_format,
-            lse=None if lse is None else lse.unsqueeze(1),
-            return_lse=self.need_to_return_lse_for_decode,
-        )
+        # ---- kingdom head-chunk patch (2026-07-04) -------------------------
+        # At TP4/DCP4 the DCP all-gather puts 64 q-heads into one kernel call,
+        # which the SM120 TRTLLM sparse-MLA kernel cannot handle (illegal memory
+        # access). Attention heads are independent given shared sparse KV, so we
+        # split the head dim into <=HEAD_CHUNK slices and run the kernel per
+        # slice - mathematically exact (no cross-chunk LSE merge required; LSE
+        # merging across DCP ranks happens upstream in mla_attention).
+        import os
+        HEAD_CHUNK = int(os.environ.get("VLLM_SM120_HEAD_CHUNK", "32"))
+
+        def _run_kernel(q_sl, out_sl, lse_sl):
+            return flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+                query=q_sl.unsqueeze(1),
+                kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+                workspace_buffer=self._workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=topk_indices_physical.unsqueeze(1),
+                seq_lens=seq_lens,
+                max_seq_len=attn_metadata.topk_tokens,
+                out=out_sl.unsqueeze(1),
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                sparse_mla_top_k=attn_metadata.topk_tokens,
+                kv_scale_format=self.kv_scale_format,
+                lse=None if lse_sl is None else lse_sl.unsqueeze(1),
+                return_lse=self.need_to_return_lse_for_decode,
+            )
+
+        if num_actual_heads <= HEAD_CHUNK:
+            ret = _run_kernel(q, output, lse)
+            if not self.need_to_return_lse_for_decode:
+                return ret.squeeze(1), None
+            if isinstance(ret, tuple):
+                out, lse = ret
+            else:
+                out = ret
+                assert lse is not None
+            lse = lse.reshape(num_actual_toks, -1)[:, :num_actual_heads].contiguous()
+            return out.squeeze(1), lse
+
+        # chunked path
+        out_chunks, lse_chunks = [], []
+        for h0 in range(0, num_actual_heads, HEAD_CHUNK):
+            h1 = min(h0 + HEAD_CHUNK, num_actual_heads)
+            q_sl = q[:, h0:h1].contiguous()
+            out_sl = output[:, h0:h1].contiguous()
+            lse_sl = (
+                lse[:, h0:h1].contiguous()
+                if lse is not None
+                else None
+            )
+            ret = _run_kernel(q_sl, out_sl, lse_sl)
+            if isinstance(ret, tuple):
+                o_sl, l_sl = ret
+            else:
+                o_sl = ret
+                l_sl = lse_sl.unsqueeze(1) if lse_sl is not None else None
+            out_chunks.append(o_sl.squeeze(1))
+            if self.need_to_return_lse_for_decode:
+                l_sl = l_sl.reshape(num_actual_toks, -1)[:, : (h1 - h0)]
+                lse_chunks.append(l_sl)
+        out = torch.cat(out_chunks, dim=1)
         if not self.need_to_return_lse_for_decode:
-            return ret.squeeze(1), None
-        if isinstance(ret, tuple):
-            out, lse = ret
-        else:
-            out = ret
-            assert lse is not None
-        lse = lse.reshape(num_actual_toks, -1)[:, :num_actual_heads].contiguous()
-        return out.squeeze(1), lse
+            return out, None
+        lse_full = torch.cat(lse_chunks, dim=1).contiguous()
+        return out, lse_full
