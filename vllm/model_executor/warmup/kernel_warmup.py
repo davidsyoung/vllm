@@ -22,6 +22,9 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
 )
+from vllm.model_executor.warmup.flashinfer_b12x_moe_warmup import (
+    flashinfer_b12x_moe_warmup,
+)
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
@@ -215,6 +218,13 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    # Warm the FlashInfer b12x NVFP4 MoE kernels last: this drives dummy runs
+    # at the max token size (growing the shared workspace to its serving-time
+    # maximum) and then the small token sizes, so the small-batch micro-path
+    # kernels JIT-compile now instead of stalling the engine mid-serving when a
+    # large prefill invalidates them. No-op unless the b12x backend is in use.
+    flashinfer_b12x_moe_warmup(worker)
 
 
 # TODO: remove once FlashInfer upstream fixes the persistent file cache
