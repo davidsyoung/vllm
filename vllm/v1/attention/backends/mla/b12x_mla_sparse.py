@@ -200,6 +200,7 @@ class B12xMLASparseBackend(AttentionBackend):
         "auto",
         "bfloat16",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
         "fp8",  # aliases for fp8_ds_mla on this backend
         "fp8_e4m3",
     ]
@@ -279,6 +280,10 @@ class B12xMLASparseBackend(AttentionBackend):
             # scales + 128 BF16 RoPE). Mirrors the FlashMLA / SPARSE_MLA_SM120
             # layout; b12x's GLM_NSA decode reads the same record.
             return (num_blocks, block_size, 656)
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # NVFP4 MLA latent: 256 B NoPE data + 32 B E4M3 scales +
+            # 16 B alignment pad + 128 B BF16 RoPE.
+            return (num_blocks, block_size, 432)
         return (num_blocks, block_size, head_size)
 
 
@@ -575,6 +580,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_num_seqs = int(scheduler_config.max_num_seqs)
         self.block_size = 64
         self._workspace_num_heads = self.num_heads * max(1, self.dcp_world_size)
+        # b12x ScaleFormat.NVFP4_E4M3 == 2 selects the 432 B/token FP4 latent
+        # record in the unified SM120 decode/extend kernels; None keeps the
+        # dtype-inferred format (ARBITRARY_FP32 for the 656 B fp8_ds_mla record).
+        self._b12x_scale_format = (
+            2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
+        )
 
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
@@ -670,6 +681,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     max_batch=int(max_batch),
                     max_chunks_per_row=self._num_splits_cap,
                     page_size=self.block_size,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale_format=self._b12x_scale_format,
                 )
             )
 
@@ -757,10 +770,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
         seen_rows: set[int] = set()
-        # GLM fp8_ds_mla cache records are 656 B/token. One page is enough:
-        # prewarm top-k indices all point at slot zero.
+        # GLM cache records are 656 B/token (fp8_ds_mla) or 432 B/token
+        # (nvfp4_ds_mla). One page is enough: prewarm top-k indices all point
+        # at slot zero.
+        record_bytes = 432 if self.kv_cache_dtype == "nvfp4_ds_mla" else 656
         kv_cache = torch.zeros(
-            (1, self.block_size, 656), dtype=torch.uint8, device=self.device
+            (1, self.block_size, record_bytes),
+            dtype=torch.uint8,
+            device=self.device,
         )
         for rows in rows_to_warm:
             rows = int(rows)
@@ -799,6 +816,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     v_head_dim=self.kv_lora_rank,
                     return_lse=True,
                     lse_scale="natural",
+                    scale_format=self._b12x_scale_format,
                 )
             else:
                 self._sparse_mla_extend_forward(
@@ -806,6 +824,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache=kv_cache,
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
+                    scale_format=self._b12x_scale_format,
                 )
             self._sync_dcp_warmup()
 
@@ -924,7 +943,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
         else:
             raise ValueError(
-                "B12X_MLA_SPARSE expected fp8_ds_mla KV cache as "
+                "B12X_MLA_SPARSE expected fp8_ds_mla/nvfp4_ds_mla KV cache as "
                 f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
                 f"{tuple(kv_u8.shape)}"
             )
@@ -969,6 +988,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         forced_num_splits=self._num_splits_cap,
                         return_lse=True,
                         lse_scale="natural",
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
                 if self._decode_num_heads != num_actual_heads:
@@ -987,6 +1007,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
                     forced_num_splits=self._num_splits_cap,
+                    scale_format=self._b12x_scale_format,
                 ),
             )
             if self._decode_num_heads != num_actual_heads:
@@ -1028,6 +1049,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         v_head_dim=self.kv_lora_rank,
                         return_lse=True,
                         lse_scale="natural",
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
             else:
@@ -1038,6 +1060,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         kv_cache=kv_cache,
                         sm_scale=self.scale,
                         v_head_dim=self.kv_lora_rank,
+                        scale_format=self._b12x_scale_format,
                     ),
                 )
             if prefill_num_heads != num_actual_heads:
