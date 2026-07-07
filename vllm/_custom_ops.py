@@ -2628,6 +2628,19 @@ def concat_and_cache_mla(
     if kv_cache_dtype == "nvfp4_ds_mla":
         concat_and_cache_nvfp4_mla(kv_c, k_pe, kv_cache, slot_mapping, scale)
         return
+    if kv_cache_dtype == "nf3_ds_mla":
+        # b12x-native CuTe-DSL writer (304 B NF3 record); registers
+        # torch.ops.b12x.concat_and_cache_nf3_mla on import.
+        from b12x.attention.mla.kv_cache import concat_and_cache_nf3_mla
+
+        concat_and_cache_nf3_mla(kv_c, k_pe, kv_cache, slot_mapping, scale)
+        return
+    if kv_cache_dtype == "nf3bf16_ds_mla":
+        # Diagnostic twin (368 B: NF3 NoPE + verbatim BF16 rope).
+        from b12x.attention.mla.kv_cache import concat_and_cache_nf3bf16_mla
+
+        concat_and_cache_nf3bf16_mla(kv_c, k_pe, kv_cache, slot_mapping, scale)
+        return
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
     )

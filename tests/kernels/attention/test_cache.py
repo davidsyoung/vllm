@@ -840,6 +840,312 @@ def test_concat_and_cache_ds_mla(
         torch.testing.assert_close(kv_rope, ref_rope, atol=0.001, rtol=0.1)
 
 
+# ── NF3 (3-bit NormalFloat) MLA KV records ──────────────────────────────────
+# Pure-torch reference encoder/decoder pair for the nf3_ds_mla (304 B) and
+# nf3bf16_ds_mla (368 B) records. The codebook is madeby561's nf3_kernel.py
+# table verbatim; encode = branchless nearest-of-8 by the 7 f32 midpoints
+# (>= picks the upper level on ties, matching the kernel's setp.ge chain);
+# scale = E4M3(group amax) since max|NF3 level| == 1.0.
+NF3_LEVELS = [-1.0, -0.6047, -0.3563, -0.1275, 0.1275, 0.3563, 0.6047, 1.0]
+NF3_MIDPOINTS = [
+    (NF3_LEVELS[i] + NF3_LEVELS[i + 1]) / 2 for i in range(7)
+]
+NF3_MAX_HALF_GAP = max(
+    NF3_LEVELS[i + 1] - NF3_LEVELS[i] for i in range(7)
+) / 2  # 0.19765 (the [-1.0, -0.6047] gap)
+NF3_GROUP_SIZE = 16
+E4M3_MAX_RCP = 1.0 / 448.0  # exact f32 constant, mirrors the write kernel
+
+
+def ref_nf3_encode(latent: torch.Tensor):
+    """Encode (num_groups, 16) f32 -> (codes u8 in 0..7, e4m3 scale bytes).
+
+    Mirrors the kernel recipe: scale byte = satfinite-E4M3(group amax);
+    values normalized by the hardware-exact DECODE of that byte; nearest
+    NF3 level via the 7 midpoint thresholds (ties -> upper level)."""
+    amax = latent.abs().amax(dim=-1)
+    scale_e4m3 = amax.to(torch.float8_e4m3fn)
+    decoded_scale = scale_e4m3.float()
+    safe = torch.where(decoded_scale > 0, decoded_scale, torch.ones_like(decoded_scale))
+    x = latent / safe[:, None]
+    thresholds = torch.tensor(
+        NF3_MIDPOINTS, dtype=torch.float32, device=latent.device
+    )
+    codes = (x.unsqueeze(-1) >= thresholds).sum(dim=-1).to(torch.uint8)
+    codes = torch.where(
+        (decoded_scale > 0)[:, None], codes, torch.zeros_like(codes)
+    )
+    return codes, scale_e4m3
+
+
+def ref_nf3_pack(codes: torch.Tensor) -> torch.Tensor:
+    """Pack (num_groups, 16) codes -> (num_groups, 6) bytes: one 48-bit
+    little-endian word per group, code j at bits [3j, 3j+3)."""
+    num_groups = codes.shape[0]
+    words = torch.zeros(num_groups, dtype=torch.int64, device=codes.device)
+    for j in range(NF3_GROUP_SIZE):
+        words |= codes[:, j].to(torch.int64) << (3 * j)
+    out = torch.empty(num_groups, 6, dtype=torch.uint8, device=codes.device)
+    for b in range(6):
+        out[:, b] = ((words >> (8 * b)) & 0xFF).to(torch.uint8)
+    return out
+
+
+def ref_nf3_unpack(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack (num_groups, 6) bytes -> (num_groups, 16) codes."""
+    num_groups = packed.shape[0]
+    words = torch.zeros(num_groups, dtype=torch.int64, device=packed.device)
+    for b in range(6):
+        words |= packed[:, b].to(torch.int64) << (8 * b)
+    codes = torch.empty(
+        num_groups, NF3_GROUP_SIZE, dtype=torch.uint8, device=packed.device
+    )
+    for j in range(NF3_GROUP_SIZE):
+        codes[:, j] = ((words >> (3 * j)) & 0x7).to(torch.uint8)
+    return codes
+
+
+def ref_nf3_decode(codes: torch.Tensor, scale_e4m3: torch.Tensor) -> torch.Tensor:
+    """Decode codes x stored E4M3 group scales -> (num_groups, 16) f32."""
+    lut = torch.tensor(NF3_LEVELS, dtype=torch.float32, device=codes.device)
+    return lut[codes.long()] * scale_e4m3.float()[:, None]
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_nf3_reference_roundtrip(seed: int) -> None:
+    """CPU-only self-test of the torch NF3 reference encoder/decoder pair:
+    encode random latents, decode via LUT x scales, and bound the error by
+    the NF3 grid half-gap; E4M3 rope lane round-trip within its half-step."""
+    set_random_seed(seed)
+    latent = torch.randn(32, NF3_GROUP_SIZE, dtype=torch.float32) * 3.0
+    latent[0] = 0.0  # all-zero group -> zero scale -> exact zeros
+    codes, scale = ref_nf3_encode(latent)
+    packed = ref_nf3_pack(codes)
+    codes2 = ref_nf3_unpack(packed)
+    assert torch.equal(codes, codes2), "48-bit LE pack/unpack must round-trip"
+    dequant = ref_nf3_decode(codes2, scale)
+    decoded_scale = scale.float()
+    err = (dequant - latent).abs()
+    bound = NF3_MAX_HALF_GAP * decoded_scale[:, None] + 2**-9
+    assert (err <= bound).all(), (
+        f"NF3 reference round-trip error {err.max().item():.5f} exceeds the "
+        f"half-gap bound"
+    )
+    assert (dequant[0] == 0).all()
+
+    # E4M3 rope lane reference: scale = amax * f32(1/448), val -> e4m3 ->
+    # x scale; error bounded by the e4m3 half-step (2^-4 relative) plus the
+    # denormal quantum.
+    rope = torch.randn(64, dtype=torch.float32)
+    rope_scale = rope.abs().max() * torch.tensor(E4M3_MAX_RCP, dtype=torch.float32)
+    rope_q = (rope / rope_scale).to(torch.float8_e4m3fn)
+    rope_dq = rope_q.float() * rope_scale
+    rope_err = (rope_dq - rope).abs()
+    rope_bound = rope.abs() * 2**-4 + rope_scale * 2**-9
+    assert (rope_err <= rope_bound).all(), (
+        f"E4M3 rope reference round-trip error {rope_err.max().item():.6f} "
+        f"exceeds the half-step bound"
+    )
+
+
+def _run_concat_and_cache_nf3_family(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    kv_cache_dtype: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip(f"{kv_cache_dtype} requires CUDA")
+    if current_platform.is_rocm():
+        pytest.skip(f"{kv_cache_dtype} is not supported on ROCm")
+    if not current_platform.has_device_capability(100):
+        pytest.skip(f"{kv_cache_dtype} requires SM100+ (Blackwell)")
+    if dtype.itemsize != 2:
+        pytest.skip(f"{kv_cache_dtype} only supports 16-bit input")
+    if kv_lora_rank != 512:
+        pytest.skip(f"{kv_cache_dtype} requires kv_lora_rank == 512")
+    # The write kernels live in the b12x package (CuTe-DSL custom ops).
+    pytest.importorskip("b12x.attention.mla.kv_cache")
+
+    rope_e4m3 = kv_cache_dtype == "nf3_ds_mla"
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    torch.accelerator.set_device_index(device)
+
+    group_size = NF3_GROUP_SIZE
+    num_groups = kv_lora_rank // group_size  # 32
+    nope_bytes = num_groups * 6  # 192
+    scale_offset = nope_bytes  # 192
+    if rope_e4m3:
+        # 304 B: NF3 + scales + e4m3 rope @224 + fp32 rope scale @288 + pad.
+        rope_offset = scale_offset + num_groups  # 224
+        rope_scale_offset = rope_offset + qk_rope_head_dim  # 288
+        pad_lo, pad_hi = rope_scale_offset + 4, 304  # [292, 304)
+        entry_size = 304
+    else:
+        # 368 B diagnostic: NF3 + scales + 16B pad + verbatim bf16 rope @240.
+        pad_lo, pad_hi = scale_offset + num_groups, scale_offset + num_groups + 16
+        rope_offset = pad_hi  # 240
+        entry_size = 368
+    assert entry_size % 16 == 0
+
+    total_slots = num_blocks * block_size
+    slot_mapping_lst = random.sample(range(total_slots), num_tokens)
+    slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long, device=device)
+
+    kv_c = torch.randn(num_tokens, kv_lora_rank, dtype=dtype, device=device)
+    k_pe = torch.randn(num_tokens, qk_rope_head_dim, dtype=dtype, device=device)
+
+    # Implicit global scale of 1.0 (group scales + the per-token rope scale
+    # carry all magnitude); the arg keeps the cache-op family signature.
+    scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, entry_size, dtype=torch.uint8, device=device
+    )
+
+    op = getattr(
+        torch.ops.b12x,
+        "concat_and_cache_nf3_mla" if rope_e4m3 else "concat_and_cache_nf3bf16_mla",
+    )
+    opcheck(
+        op,
+        (kv_c, k_pe, kv_cache, slot_mapping),
+        test_utils=DEFAULT_OPCHECK_TEST_UTILS,
+    )
+
+    # Route through the public entry point: concat_and_cache_mla dispatches
+    # to the b12x NF3 ops on the nf3 kv_cache_dtype strings.
+    ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
+
+    for i in range(num_tokens):
+        slot = slot_mapping_lst[i]
+        block_idx = slot // block_size
+        block_offset = slot % block_size
+        record = kv_cache[block_idx, block_offset]
+
+        # Group scales: E4M3(group_amax) -- max|NF3 level| == 1.0 so the
+        # divide degenerates. Round-to-nearest E4M3 stays within half a
+        # mantissa step (<= 6.25% relative).
+        kv_scales = (
+            record[scale_offset : scale_offset + num_groups]
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
+        latent = kv_c[i].float().reshape(num_groups, group_size)
+        group_amax = latent.abs().amax(dim=-1)
+        torch.testing.assert_close(kv_scales, group_amax, atol=2**-9, rtol=0.07)
+
+        # NoPE payload: reference-decode the packed NF3 codes x stored group
+        # scales; the element error is bounded by the NF3 grid's largest
+        # half-gap (0.19765) x the stored scale (the kernel's rcp.approx
+        # inverse can flip exact-midpoint ties, which stays within the same
+        # bound by construction).
+        codes = ref_nf3_unpack(record[:nope_bytes].reshape(num_groups, 6))
+        dequant = ref_nf3_decode(codes, record[scale_offset : scale_offset + num_groups].view(torch.float8_e4m3fn))
+        err = (dequant - latent).abs()
+        bound = NF3_MAX_HALF_GAP * kv_scales[:, None] + 2**-9
+        assert (err <= bound).all(), (
+            f"nf3 dequant error {err.max().item():.4f} exceeds the NF3 "
+            f"half-gap bound at token {i}"
+        )
+
+        # The alignment pad is zero-filled.
+        assert (record[pad_lo:pad_hi] == 0).all()
+
+        if rope_e4m3:
+            # Stored fp32 rope scale == amax * f32(1/448) (exact constant
+            # multiply in the kernel; both sides compute in f32).
+            stored_scale = record[
+                rope_scale_offset : rope_scale_offset + 4
+            ].view(torch.float32)[0]
+            rope_f32 = k_pe[i].float()
+            ref_scale = rope_f32.abs().max() * torch.tensor(
+                E4M3_MAX_RCP, dtype=torch.float32, device=device
+            )
+            torch.testing.assert_close(
+                stored_scale, ref_scale, atol=2**-20, rtol=2**-18
+            )
+            # E4M3 rope round-trip <= half-step (+ rcp.approx slack).
+            rope_dq = (
+                record[rope_offset : rope_offset + qk_rope_head_dim]
+                .view(torch.float8_e4m3fn)
+                .float()
+                * stored_scale
+            )
+            rope_err = (rope_dq - rope_f32).abs()
+            rope_bound = rope_f32.abs() * (2**-4 + 2**-10) + stored_scale * 2**-9 + 2**-12
+            assert (rope_err <= rope_bound).all(), (
+                f"e4m3 rope error {rope_err.max().item():.5f} exceeds the "
+                f"half-step bound at token {i}"
+            )
+        else:
+            # RoPE lane is a verbatim 16-bit copy.
+            kv_rope = record[rope_offset:].view(dtype)
+            torch.testing.assert_close(kv_rope, k_pe[i], atol=0.0, rtol=0.0)
+
+    # Slots outside the mapping stay untouched (indexing/stride isolation).
+    written = torch.zeros(total_slots, dtype=torch.bool, device=device)
+    written[slot_mapping] = True
+    untouched = kv_cache.reshape(total_slots, entry_size)[~written]
+    assert (untouched == 0).all()
+
+
+@pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
+@pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_concat_and_cache_nf3_mla(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    _run_concat_and_cache_nf3_family(
+        kv_lora_rank, qk_rope_head_dim, num_tokens, block_size, num_blocks,
+        dtype, seed, device, kv_cache_dtype="nf3_ds_mla",
+    )
+
+
+@pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
+@pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
+@pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_concat_and_cache_nf3bf16_mla(
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_tokens: int,
+    block_size: int,
+    num_blocks: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    _run_concat_and_cache_nf3_family(
+        kv_lora_rank, qk_rope_head_dim, num_tokens, block_size, num_blocks,
+        dtype, seed, device, kv_cache_dtype="nf3bf16_ds_mla",
+    )
+
+
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
 @pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
