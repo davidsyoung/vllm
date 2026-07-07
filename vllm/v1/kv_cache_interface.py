@@ -63,7 +63,9 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
+    if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla", "nf3_ds_mla", "nf3bf16_ds_mla"):
+        # The NF3 MLA records ride the NVFP4 quant mode: uint8 storage,
+        # group-scale sub-byte latent, no per-tensor scale plumbing.
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
@@ -399,6 +401,14 @@ class MLAAttentionSpec(FullAttentionSpec):
             # 432 B/token: 256B FP4 NoPE + 32B E4M3 scales +
             # 16B alignment pad + 128B BF16 RoPE.
             return self.block_size * 432
+        if self.cache_dtype_str == "nf3_ds_mla":
+            # 304 B/token: 192B NF3 NoPE + 32B E4M3 scales +
+            # 64B E4M3 RoPE + 4B fp32 rope scale + 12B pad.
+            return self.block_size * 304
+        if self.cache_dtype_str == "nf3bf16_ds_mla":
+            # 368 B/token diagnostic: 192B NF3 NoPE + 32B E4M3 scales +
+            # 16B pad + 128B BF16 RoPE.
+            return self.block_size * 368
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -600,6 +610,14 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             # 432 B/token: 256B FP4 NoPE + 32B E4M3 scales +
             # 16B alignment pad + 128B BF16 RoPE.
             return self.storage_block_size * 432
+        if self.cache_dtype_str == "nf3_ds_mla":
+            # 304 B/token: 192B NF3 NoPE + 32B E4M3 scales +
+            # 64B E4M3 RoPE + 4B fp32 rope scale + 12B pad.
+            return self.storage_block_size * 304
+        if self.cache_dtype_str == "nf3bf16_ds_mla":
+            # 368 B/token diagnostic: 192B NF3 NoPE + 32B E4M3 scales +
+            # 16B pad + 128B BF16 RoPE.
+            return self.storage_block_size * 368
         if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
             # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to

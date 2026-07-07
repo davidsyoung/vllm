@@ -144,6 +144,8 @@ class B12xMLASparseBackend(AttentionBackend):
         "bfloat16",
         "fp8_ds_mla",
         "nvfp4_ds_mla",
+        "nf3_ds_mla",
+        "nf3bf16_ds_mla",
         "fp8",  # aliases for fp8_ds_mla on this backend
         "fp8_e4m3",
     ]
@@ -227,6 +229,14 @@ class B12xMLASparseBackend(AttentionBackend):
             # NVFP4 MLA latent: 256 B NoPE data + 32 B E4M3 scales +
             # 16 B alignment pad + 128 B BF16 RoPE.
             return (num_blocks, block_size, 432)
+        if cache_dtype_str == "nf3_ds_mla":
+            # NF3 MLA latent: 192 B NF3 3-bit NoPE + 32 B E4M3 scales +
+            # 64 B E4M3 RoPE + 4 B fp32 rope scale + 12 B pad.
+            return (num_blocks, block_size, 304)
+        if cache_dtype_str == "nf3bf16_ds_mla":
+            # NF3 diagnostic twin: 192 B NF3 NoPE + 32 B E4M3 scales +
+            # 16 B pad + 128 B verbatim BF16 RoPE.
+            return (num_blocks, block_size, 368)
         return (num_blocks, block_size, head_size)
 
 
@@ -565,17 +575,22 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # DCP backend. The kernel must therefore plan for, and return, the full
         # gathered head set; the outer layer reduces/scatters it back afterward.
         self._input_num_heads = self.num_heads * self.dcp_world_size
-        # kingdom(nvfp4_ds_mla): b12x ScaleFormat.NVFP4_E4M3 == 2 selects the
-        # 432 B/token FP4 latent record in the unified SM120 decode/extend
-        # kernels; None keeps the dtype-inferred format (ARBITRARY_FP32 for
-        # the 656 B fp8_ds_mla record).
-        self._b12x_scale_format = (
-            2 if self.kv_cache_dtype == "nvfp4_ds_mla" else None
-        )
+        # kingdom(nvfp4_ds_mla): b12x ScaleFormat selects the packed-latent
+        # record in the unified SM120 decode/extend kernels: NVFP4_E4M3 == 2
+        # (432 B/token), NF3_E4M3 == 3 (304 B/token, e4m3 rope + fp32 rope
+        # scale), NF3_BF16ROPE == 4 (368 B/token diagnostic). None keeps the
+        # dtype-inferred format (ARBITRARY_FP32 for the 656 B fp8_ds_mla
+        # record).
+        self._b12x_scale_format = {
+            "nvfp4_ds_mla": 2,
+            "nf3_ds_mla": 3,
+            "nf3bf16_ds_mla": 4,
+        }.get(self.kv_cache_dtype)
         # kingdom(nvfp4_ds_mla): forwarded into every plan/decode/extend b12x
-        # call ONLY for the FP4 record, so fp8_ds_mla serving keeps the stock
-        # b12x call signature (works on a b12x tree without the nvfp4-ds-mla
-        # read-path port; the port is required only to serve nvfp4_ds_mla).
+        # call ONLY for the packed-latent records, so fp8_ds_mla serving keeps
+        # the stock b12x call signature (works on a b12x tree without the
+        # packed-latent read-path port; the port is required only to serve
+        # nvfp4_ds_mla / nf3_ds_mla / nf3bf16_ds_mla).
         self._b12x_nvfp4_kwargs: dict[str, Any] = (
             {}
             if self._b12x_scale_format is None
@@ -755,7 +770,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # to reach here; verifier-only and eager-snap both skipped it).
         # One page is enough: prewarm top-k indices all point at slot zero.
         # kingdom(nvfp4_ds_mla): record width follows the cache dtype.
-        record_bytes = 432 if self.kv_cache_dtype == "nvfp4_ds_mla" else 656
+        record_bytes = {
+            "nvfp4_ds_mla": 432,
+            "nf3_ds_mla": 304,
+            "nf3bf16_ds_mla": 368,
+        }.get(self.kv_cache_dtype, 656)
         kv_cache = torch.zeros(
             (1, self.block_size, record_bytes),
             dtype=torch.uint8,
@@ -929,7 +948,8 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
         else:
             raise ValueError(
-                "B12X_MLA_SPARSE expected fp8_ds_mla/nvfp4_ds_mla KV cache as "
+                "B12X_MLA_SPARSE expected fp8_ds_mla/nvfp4_ds_mla/nf3_ds_mla/"
+                "nf3bf16_ds_mla KV cache as "
                 f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
                 f"{tuple(kv_u8.shape)}"
             )
